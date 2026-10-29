@@ -1,0 +1,27 @@
+# ===== 绝对不能提交：浏览器配置目录 =====
+# _edge_profile 是 Edge 的 user-data-dir，里面存着百度网盘的登录 Cookie。
+# 一旦推上去就等于把账号交出去，务必保持忽略。
+_edge_profile/
+**/_edge_profile/
+
+# ===== 打包产物 =====
+# exe + _internal 合计约 900MB，且每次都由 pyinstaller 重新生成
+dist/
+build/
+*.spec
+
+# ===== 运行时生成物 =====
+sync_delete_log.txt
+# 程序运行时会截一堆图用于定位/核对
+_*.png
+*.png
+
+# ===== Python 缓存 =====
+__pycache__/
+*.pyc
+*.pyo
+
+# ===== 调试输出 =====
+_gui_out.txt
+_gui_err.txt
+_cv2test.txt
