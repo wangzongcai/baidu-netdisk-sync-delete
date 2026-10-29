@@ -35,6 +35,10 @@ else:
 LEAD_MS = 20.0        # 网页端提前量基准：单文件时网页本地段比客户端慢约 20ms
 CLIENT_LOCAL_MS = 7.0 # 客户端「点击→发出请求」的经验值（实测 6~8ms，无法直接测量）
 
+# 最近一轮的关键数字，跑完由 main() 填好，界面直接拿它渲染简洁结论。
+# 让界面不用去解析日志文本，数字来源只有一个，不会两处对不上。
+LAST_RESULT = {}
+
 
 # ---------------- 提前量自动校准（跨轮记忆） ----------------
 def cal_path():
@@ -797,6 +801,17 @@ def main():
         print(f"  下次建议: 勾选数量差不多时，提前量用 {best_lead:.0f} ms"
               f"（本轮实际用了 {lead_ms:.0f} ms）")
     print(bar)
+
+    # 把关键数字交给界面。符号约定：delta_ms 正数 = 客户端晚完成（网页端先删完）
+    LAST_RESULT.clear()
+    LAST_RESULT.update({
+        "n_sel": n_sel,
+        "web_local_ms": None if web_local_ms is None else round(web_local_ms, 1),
+        "send_diff": None if send_diff is None else round(send_diff, 1),
+        "delta_ms": None if delta_ms is None else round(delta_ms, 1),
+        "delta_src": delta_src,
+        "trusted": bool(clip["done_page"]),
+    })
 
     try:
         cdp.detach()
