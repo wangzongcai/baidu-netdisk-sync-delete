@@ -471,6 +471,9 @@ def main():
     ts = {}
     ev = {"req": None, "req_url": "", "req_body": "", "resp": None, "req_m": ""}
     all_req = []
+    # 删除接口的响应对象先攒着，报告阶段再读头和体——
+    # Playwright 同步 API 不允许在事件回调里直接读 body，会卡住事件循环。
+    del_resps = []
     # 网页端删除请求真正发出的那一刻会置位，客户端据此立刻点击
     sent_event = threading.Event()
 
@@ -494,6 +497,9 @@ def main():
     def on_response(r):
         if ev["resp"] is None and ev["req_url"] and r.url == ev["req_url"]:
             ev["resp"] = time.perf_counter_ns()
+        # 只留下删除接口的响应，事后检查服务器到底怎么回的（缓存？排队？报错？）
+        if "garbagedelete" in r.url.lower():
+            del_resps.append(r)
 
     page.on("request", on_request)
     page.on("response", on_response)
@@ -732,6 +738,29 @@ def main():
     print("\n--- 本次窗口内请求(调试) ---")
     for t, m, u in all_req[:20]:
         print(f"  +{(t-wc)/1e6:8.1f}ms {m:6s} {u[:100]}")
+
+    # 服务器到底怎么回的：看到这组头/体，才能分清是缓存、排队，还是直接报错
+    if del_resps:
+        print("\n--- 服务器响应详情（判断缓存/排队/报错） ---")
+        for r in del_resps:
+            print(f"   [{r.status}] {r.url[:90]}")
+            try:
+                h = r.all_headers()
+            except Exception as e:
+                h = {}
+                print(f"     读响应头失败: {e}")
+            # 只有这几个头能说明缓存或排队，其余列个名字备查
+            pick = ("x-cache", "x-bd-taskid", "x-bd-server", "x-bd-locate",
+                    "x-request-id", "server-timing", "via", "age", "content-length")
+            for k, v in sorted(h.items()):
+                if k.lower() in pick:
+                    print(f"     {k}: {v}")
+            print(f"     全部头名: {', '.join(sorted(h.keys()))}")
+            try:
+                body = r.text()
+            except Exception as e:
+                body = f"(读不到: {e})"
+            print(f"     响应体: {body[:600]}")
 
     page.wait_for_timeout(400)
     after = page.evaluate(r"""() => {
