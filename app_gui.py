@@ -46,10 +46,10 @@ class App:
         tk.Button(top, text="① 启动 Edge 调试端口", command=self.do_launch,
                   width=20).pack(side="left", padx=(0, 6))
 
-        tk.Label(top, text="提前量 ms:").pack(side="left", padx=(14, 2))
-        # 默认「自动」：程序按网页端已选数量自己换算提前量
-        self.lead = tk.Entry(top, width=6)
-        self.lead.insert(0, "自动")
+        tk.Label(top, text="同步方式:").pack(side="left", padx=(14, 2))
+        # 留空 = 事件驱动（推荐）：等网页端请求真的发出去再点客户端。
+        # 填数字 = 时间预置：网页端点完固定等这么多毫秒，保留作对照用。
+        self.lead = tk.Entry(top, width=8)
         self.lead.pack(side="left")
 
         # 只看不删，放在右边当次要功能
@@ -79,14 +79,9 @@ class App:
                  "     核对不通过（比如确认框没调出来）会自动中止，不会乱点。\n"
                  "─────────────────────────────────────────────\n")
 
-        # 显示本机提前量校准状态
-        cal = core.load_cal()
-        if "base_ms" in cal:
-            self.log(f"本机已校准：提前量基准 {cal['base_ms']:.1f} ms"
-                     f"（{cal.get('updated', '?')} 更新，上次残差 {cal.get('last_delta_ms', '?')} ms）\n"
-                     f"每轮跑完会自动修正基准，不需要你手动填。\n\n")
-        else:
-            self.log("本机尚未校准：首次运行按默认值走，跑完自动记录，之后就不用管了。\n\n")
+        self.log("同步方式：默认『事件驱动』——网页端删除请求一发出，客户端立刻跟着点，\n"
+                 "不需要预测提前量，也不用校准。上面的输入框留空即可。\n"
+                 "只有在需要做对照时，才在里面填一个毫秒数（时间预置模式）。\n\n")
 
         self.pump()
 
@@ -140,12 +135,12 @@ class App:
         if dry:
             args.append("--dry")
         lead = self.lead.get().strip()
-        if lead and lead != "自动":
+        if lead:
             try:
                 float(lead)
                 args.append(f"--lead={lead}")
             except ValueError:
-                self.log(f"提前量 '{lead}' 不是数字，按自动处理\n")
+                self.log(f"同步方式填的 '{lead}' 不是数字，按事件驱动处理\n")
 
         def work():
             old_argv, old_out = sys.argv, sys.stdout

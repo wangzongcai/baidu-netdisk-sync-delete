@@ -467,11 +467,17 @@ def main():
     ts = {}
     ev = {"req": None, "req_url": "", "req_body": "", "resp": None, "req_m": ""}
     all_req = []
+    # 网页端删除请求真正发出的那一刻会置位，客户端据此立刻点击
+    sent_event = threading.Event()
 
     def on_request(r):
         now = time.perf_counter_ns()
         all_req.append((now, r.method, r.url))
-        if ev["req"] is None and r.method in ("POST", "DELETE", "PUT"):
+        # 必须限定成「删除接口」本身。点确定后浏览器可能先发别的 POST（埋点、上报之类），
+        # 如果拿它当触发信号，客户端会在网页端真正删除之前就被点下去。
+        is_delete_api = (r.method in ("POST", "DELETE", "PUT")
+                         and "delete" in r.url.lower())
+        if ev["req"] is None and is_delete_api:
             ev["req"] = now
             ev["req_m"] = r.method
             ev["req_url"] = r.url
@@ -479,6 +485,7 @@ def main():
                 ev["req_body"] = (r.post_data or "")[:400]
             except Exception:
                 ev["req_body"] = ""
+            sent_event.set()
 
     def on_response(r):
         if ev["resp"] is None and ev["req_url"] and r.url == ev["req_url"]:
@@ -531,29 +538,25 @@ def main():
         n_sel = int(info["selected"])
     except (TypeError, ValueError):
         n_sel = 1
-    # 优先用历史实测的「网页端本地段」直接预测（比按数量公式准得多），
-    # 预测不到才退回粗估公式
-    pred_local = predict_web_local(cal, n_sel)
-    if pred_local is not None and pred_local > 10:
-        auto_lead = max(0.0, pred_local - CLIENT_LOCAL_MS)
-        pred_src = f"历史实测≈{pred_local:.0f}ms"
-    else:
-        auto_lead = base_ms + (max(n_sel, 1) - 1) * per_file_ms
-        pred_src = "按数量粗估（本机还没有这一档的历史）"
 
-    lead_ms = auto_lead
+    # 两种同步方式：
+    #   事件驱动（默认）—— 等网页端删除请求**真的发出去**，再立刻点客户端。
+    #       不再猜"网页端要花多久"：实测同样勾 8 个，本地段能在 175.8ms 和 356.0ms
+    #       之间乱跳（差一倍），任何按数量算出来的提前量都会偏掉一两百毫秒。
+    #   时间预置（--lead=N）—— 页面点完固定等 N 毫秒再点客户端，保留作手动对照。
     manual = False
+    lead_ms = 0.0
     for a in sys.argv:
         if a.startswith("--lead="):
             lead_ms = float(a.split("=", 1)[1])
             manual = True
+    event_mode = not manual
     lead_ns = int(lead_ms * 1e6)
 
-    if manual:
-        src = "手动指定"
+    if event_mode:
+        print("同步方式: 事件驱动 —— 网页端请求一发出就立刻点客户端（不再预测提前量）")
     else:
-        src = f"自动·已选 {n_sel} 个，{pred_src}"
-    print(f"补偿同步: 网页端先点 {lead_ms:+.0f} ms（{src}；正数=网页先）")
+        print(f"同步方式: 时间预置 —— 网页端点完 {lead_ms:+.0f} ms 后点客户端（手动指定）")
 
     barrier = threading.Barrier(2)
     web_clicked = threading.Event()
@@ -562,7 +565,13 @@ def main():
     def client_worker():
         try:
             barrier.wait()
-            if lead_ns > 0:
+            if event_mode:
+                # 等网页端把删除请求**真正发出去**（不是"网页端点完了"）
+                # 这一步用实测代替预测，网页端快也好慢也好，都紧跟着点
+                if not sent_event.wait(3.0):
+                    clip["err"] = "等网页端请求发出超时(3s)"
+                    return
+            elif lead_ns > 0:
                 web_clicked.wait()
                 target = ts["web_click"] + lead_ns
                 while time.perf_counter_ns() < target:   # 忙等到目标时刻
@@ -618,9 +627,11 @@ def main():
               "button": "left", "clickCount": 1})
     ts["web_click_done"] = time.perf_counter_ns()
 
-    # 关键: 用 wait_for_timeout 驱动 Playwright 事件循环
-    for _ in range(150):
-        page.wait_for_timeout(20)
+    # 关键: 用 wait_for_timeout 驱动 Playwright 事件循环。
+    # 事件驱动模式下，request 事件派发得越快，客户端点得越贴近网页端发请求的那一刻，
+    # 所以这里轮询间隔要短（20ms 太粗，会让残差直接多出 20ms）。
+    for _ in range(3000):
+        page.wait_for_timeout(1)
         if clip["done"] and ev["resp"]:
             break
     page.wait_for_timeout(400)
@@ -671,24 +682,22 @@ def main():
     web_local_ms = None
     if ev["req"]:
         web_local_ms = (ev["req"] - wc) / 1e6
-        print("\n===== ⑤ 提前量校准 =====")
-        print(f"   网页端本地段(点击→请求发出) = {web_local_ms:+.1f} ms")
-        print(f"   客户端本地段(经验值)         = {CLIENT_LOCAL_MS:.0f} ms")
-        target = web_local_ms - CLIENT_LOCAL_MS
-        print(f"   → 本轮理想提前量 ≈ {target:+.1f} ms（本次实际用的是 {lead_ms:.0f} ms）")
+        print("\n===== ⑤ 链路分解 =====")
+        print(f"   网页端: 点击 → 请求发出 = {web_local_ms:.1f} ms")
+        if event_mode:
+            lag = (cc - ev["req"]) / 1e6
+            print(f"   事件驱动: 网页端请求发出 → 客户端点击 = {lag:.1f} ms")
+            print("     （这段是 CDP 事件派发延迟，不含网络；越短越好）")
+        print(f"   客户端: 点击 → 请求发出 = {CLIENT_LOCAL_MS:.0f} ms（经验值，无法直接测）")
 
-        # 校准依据是「网页端本地段」——这是每轮直接实测的，比两端响应对拍可靠
-        # 样本按「(勾选数量, 本地段)」成对保存：本地段跟数量强相关，
-        # 只存毫秒数会把 5 个和 285 个混在一起，中位数毫无意义
-        if manual:
-            print("   （本次手动指定提前量，未自动校准）")
-        elif web_local_ms < 10:
-            print("   → 网页端本地段异常(<10ms，可能没抓到真实请求)，跳过校准")
+        # 仍然把「网页端本地段」记进历史：不是为了预测（预测已证明不靠谱），
+        # 而是为了看清它到底能波动多大
+        if web_local_ms < 10:
+            print("   → 网页端本地段异常(<10ms，可能没抓到真实请求)，跳过记录")
         else:
             hist = [h for h in (cal.get("history") or []) if isinstance(h, dict)]
             new_pt = {"n": n_sel, "ms": round(web_local_ms, 1)}
             hist = (hist + [new_pt])[-12:]
-            # 顺便拟合出 (数量→本地段) 的直线，用于数量差得远时的外推兜底
             fit_note = ""
             if len(hist) >= 2 and len({h["n"] for h in hist}) >= 2 \
                     and must_spread([h["n"] for h in hist]):
@@ -711,10 +720,10 @@ def main():
             if save_cal(cal):
                 print(f"   → 已记下「{n_sel} 个 ≈ {web_local_ms:.0f} ms」，累计 {len(hist)} 次样本"
                       f"{fit_note}")
-                print(f"   → 下次勾选数量接近时，直接用实测值，不再靠公式猜")
+                if not event_mode:
+                    print(f"   → 下次勾选数量接近时，直接用实测值，不再靠公式猜")
             else:
-                print(f"   → 建议下次提前量 {max(0.0, web_local_ms - CLIENT_LOCAL_MS):.0f} ms"
-                      "（保存失败，下次需手动设）")
+                print("   （校准值保存失败）")
 
     print("\n--- 本次窗口内请求(调试) ---")
     for t, m, u in all_req[:20]:
@@ -752,7 +761,7 @@ def main():
             print(f"     >>> 客户端晚发出 {send_diff:.1f} ms <<<")
         else:
             print(f"     >>> 客户端早发出 {-send_diff:.1f} ms <<<")
-        print("     这个差由提前量直接决定，是能调到 0 的那个")
+        print("     这个差就是客户端比网页端晚发出多少，是能调到 0 的那个")
     else:
         print("  ① 两端请求「发出」时刻差：没抓到网页端请求，这轮无法判断")
 
@@ -780,8 +789,9 @@ def main():
         cal["last_delta_ms"] = round(delta_ms, 1)
         save_cal(cal)
 
-    # 提前量建议：只信「网页端本地段」这个直接实测的数，不看 ② 那个含服务器抖动的
-    if web_local_ms is not None:
+    # 事件驱动模式下没有"下次建议"——提前量这个概念已经不用了，
+    # 客户端是跟着网页端实际发出请求的那一刻动的，不用猜。
+    if not event_mode and web_local_ms is not None:
         best_lead = max(0.0, web_local_ms - CLIENT_LOCAL_MS)
         print()
         print(f"  下次建议: 勾选数量差不多时，提前量用 {best_lead:.0f} ms"
