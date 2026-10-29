@@ -556,15 +556,27 @@ def main():
     #   时间预置（--lead=N）—— 页面点完固定等 N 毫秒再点客户端，保留作手动对照。
     manual = False
     lead_ms = 0.0
+    # --gap=N：目标「两端请求发出」的时间差。仍然走事件驱动（等网页端请求真的发出），
+    # 再按目标差补一段等待，用于做「差值大小有无影响」的对照实验。
+    gap_ms = None
     for a in sys.argv:
         if a.startswith("--lead="):
             lead_ms = float(a.split("=", 1)[1])
             manual = True
+        elif a.startswith("--gap="):
+            try:
+                gap_ms = abs(float(a.split("=", 1)[1]))
+            except ValueError:
+                gap_ms = None
     event_mode = not manual
     lead_ns = int(lead_ms * 1e6)
 
     if event_mode:
-        print("同步方式: 事件驱动 —— 网页端请求一发出就立刻点客户端（不再预测提前量）")
+        if gap_ms is None:
+            print("同步方式: 事件驱动 —— 网页端请求一发出就立刻点客户端（不再预测提前量）")
+        else:
+            print(f"同步方式: 事件驱动 + 目标发出差 {gap_ms:.0f} ms —— "
+                  f"网页端请求发出后，补等到差值为 {gap_ms:.0f} ms 再点客户端")
     else:
         print(f"同步方式: 时间预置 —— 网页端点完 {lead_ms:+.0f} ms 后点客户端（手动指定）")
 
@@ -581,6 +593,13 @@ def main():
                 if not sent_event.wait(3.0):
                     clip["err"] = "等网页端请求发出超时(3s)"
                     return
+                if gap_ms is not None:
+                    # 目标: 两端请求发出时刻差 = gap_ms。
+                    # 客户端从点击到发出约 7ms，所以点击要提前这么多。
+                    base = ev["req"] or ts["web_click"]
+                    target = base + int((gap_ms - CLIENT_LOCAL_MS) * 1e6)
+                    while time.perf_counter_ns() < target:   # 忙等到目标时刻
+                        pass
             elif lead_ns > 0:
                 web_clicked.wait()
                 target = ts["web_click"] + lead_ns

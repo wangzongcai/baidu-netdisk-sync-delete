@@ -54,8 +54,14 @@ class App:
         tk.Label(top, text="同步方式:").pack(side="left", padx=(14, 2))
         # 留空 = 事件驱动（推荐）：等网页端请求真的发出去再点客户端。
         # 填数字 = 时间预置：网页端点完固定等这么多毫秒，保留作对照用。
-        self.lead = tk.Entry(top, width=8)
+        self.lead = tk.Entry(top, width=7)
         self.lead.pack(side="left")
+
+        tk.Label(top, text="发出差ms:").pack(side="left", padx=(10, 2))
+        # 留空 = 立刻点（现状，实测差 7ms 左右）。
+        # 填数字 = 目标「两端请求发出」的时间差，用来对照「差值大小有无影响」。
+        self.gap = tk.Entry(top, width=6)
+        self.gap.pack(side="left")
 
         # 详细日志开关放在右上角
         self.detail_btn = tk.Button(top, text="详细日志 ▾", command=self.toggle_detail)
@@ -116,8 +122,10 @@ class App:
                  "     核对不通过（比如确认框没调出来）会自动中止，不会乱点。\n"
                  "─────────────────────────────────────────────\n")
         self.log("同步方式：默认『事件驱动』——网页端删除请求一发出，客户端立刻跟着点，\n"
-                 "不需要预测提前量，也不用校准。上面的输入框留空即可。\n"
-                 "只有在需要做对照时，才在里面填一个毫秒数（时间预置模式）。\n\n")
+                 "不需要预测提前量，也不用校准。两个输入框都留空即可。\n"
+                 "  · 同步方式填数字 = 时间预置：网页端点完固定等 N 毫秒再点客户端。\n"
+                 "  · 发出差填数字 = 目标「两端请求发出」的时间差。比如填 50，\n"
+                 "    程序会让客户端晚一点发，让两条请求拉开 50ms，用来做对照实验。\n\n")
 
         self.pump()
 
@@ -244,6 +252,14 @@ class App:
                 args.append(f"--lead={lead}")
             except ValueError:
                 self.log(f"同步方式填的 '{lead}' 不是数字，按事件驱动处理\n")
+
+        gap = self.gap.get().strip()
+        if gap:
+            try:
+                float(gap)
+                args.append(f"--gap={gap}")
+            except ValueError:
+                self.log(f"发出差填的 '{gap}' 不是数字，按即时点击处理\n")
 
         def work():
             old_argv, old_out = sys.argv, sys.stdout
