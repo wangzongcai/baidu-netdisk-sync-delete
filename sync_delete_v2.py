@@ -740,6 +740,8 @@ def main():
         print(f"  +{(t-wc)/1e6:8.1f}ms {m:6s} {u[:100]}")
 
     # 服务器到底怎么回的：看到这组头/体，才能分清是缓存、排队，还是直接报错
+    web_errno = None       # 服务器的业务错误码，0 = 成功
+    web_status = None      # success / 其它
     if del_resps:
         print("\n--- 服务器响应详情（判断缓存/排队/报错） ---")
         for r in del_resps:
@@ -749,9 +751,10 @@ def main():
             except Exception as e:
                 h = {}
                 print(f"     读响应头失败: {e}")
-            # 只有这几个头能说明缓存或排队，其余列个名字备查
+            # 这几个头直接打值：flow-level 看着像流量分级，其余是百度内部标记
             pick = ("x-cache", "x-bd-taskid", "x-bd-server", "x-bd-locate",
-                    "x-request-id", "server-timing", "via", "age", "content-length")
+                    "x-request-id", "server-timing", "via", "age", "content-length",
+                    "flow-level", "logid", "yld", "yme", "date")
             for k, v in sorted(h.items()):
                 if k.lower() in pick:
                     print(f"     {k}: {v}")
@@ -761,6 +764,20 @@ def main():
             except Exception as e:
                 body = f"(读不到: {e})"
             print(f"     响应体: {body[:600]}")
+            # 解析业务结果：errno=0 且 status=success 才算网页端真的删成了
+            try:
+                import json as _json
+                j = _json.loads(body)
+                web_errno = j.get("errno")
+                web_status = j.get("status")
+                es = j.get("error_status") or {}
+                vals = {}
+                for v in es.values():
+                    vals[str(v)] = vals.get(str(v), 0) + 1
+                print(f"     → errno={web_errno} status={web_status} "
+                      f"条目={len(es)} 状态分布={vals}")
+            except Exception as e:
+                print(f"     → 响应体不是 JSON，没法判断成败: {e}")
 
     page.wait_for_timeout(400)
     after = page.evaluate(r"""() => {
@@ -840,6 +857,12 @@ def main():
         "delta_ms": None if delta_ms is None else round(delta_ms, 1),
         "delta_src": delta_src,
         "trusted": bool(clip["done_page"]),
+        # 双端到底删成没删成，比时间差重要得多
+        "web_errno": web_errno,
+        "web_status": web_status,
+        "web_ok": (web_errno == 0 and web_status == "success"
+                   if web_errno is not None else None),
+        "client_ok": bool(clip["done_page"]),
     })
 
     try:

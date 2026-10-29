@@ -80,11 +80,18 @@ class App:
                               font=("Microsoft YaHei", 9), anchor="w")
         self.l_ctx.pack(fill="x", padx=12, pady=(8, 2))
 
-        # 主结论：谁先删完、差多少 —— 先删完的永远排在这一行里最前面
+        # 第一结论：双端到底删成了没有 —— 服务器 errno 和客户端完成页给答案，
+        # 这比时间差重要得多，所以放最大最上面
+        self.l_ok = tk.Label(brief, text="双端删除：—",
+                             bg="#f5f7fa", fg="#202124",
+                             font=("Microsoft YaHei", 16, "bold"), anchor="w")
+        self.l_ok.pack(fill="x", padx=12, pady=(2, 0))
+
+        # 第二结论：谁先删完、差多少 —— 先删完的永远排在这一行里最前面
         self.l_main = tk.Label(brief, text="双删完成：—",
-                               bg="#f5f7fa", fg="#202124",
-                               font=("Microsoft YaHei", 17, "bold"), anchor="w")
-        self.l_main.pack(fill="x", padx=12, pady=2)
+                               bg="#f5f7fa", fg="#5f6368",
+                               font=("Microsoft YaHei", 12), anchor="w")
+        self.l_main.pack(fill="x", padx=12, pady=(0, 2))
 
         # 次结论：两端请求「发出」时刻差
         self.l_send = tk.Label(brief, text="请求发出：—",
@@ -150,7 +157,8 @@ class App:
         r = dict(core.LAST_RESULT)
         if not r:
             self.l_ctx.configure(text="没拿到本轮数据（只核对不删，或执行出错）")
-            self.l_main.configure(text="双删完成：—", fg="#202124")
+            self.l_ok.configure(text="双端删除：—", fg="#202124")
+            self.l_main.configure(text="双删完成：—", fg="#5f6368")
             self.l_send.configure(text="请求发出：—")
             return
 
@@ -159,21 +167,27 @@ class App:
         wl = r.get("web_local_ms")
         if wl is not None:
             ctx += f" · 网页端本地段 {wl:.0f} ms"
-        ctx += " · 完成页已确认" if r.get("trusted") else " · 未见完成页（信号存疑）"
         self.l_ctx.configure(text=ctx)
 
-        # 主结论：符号约定 delta = 客户端完成 − 网页端完成，
-        # 正数 = 客户端晚完成 = 网页端先删完；负数 = 客户端先删完
+        # 第一条：双端成败。网页端看服务器 errno，客户端看「清理完成」页
+        def mark(v):
+            return "✓" if v is True else ("✗" if v is False else "?")
+        wo, co = r.get("web_ok"), r.get("client_ok")
+        self.l_ok.configure(
+            text=f"双端删除：网页端 {mark(wo)} | 客户端 {mark(co)}",
+            fg="#137333" if (wo is True and co is True)
+            else ("#c5221f" if (wo is False or co is False) else "#b26a00"))
+
+        # 第二条：谁先删完、差多少（时间差随服务器快慢被拉大，仅参考）
+        # 符号约定 delta = 客户端完成 − 网页端完成，正数 = 网页端先删完
         d = r.get("delta_ms")
         if d is None:
-            self.l_main.configure(text="双删完成：未测到 | 时间差 ?", fg="#b26a00")
+            self.l_main.configure(text="双删完成：未测到 | 时间差 ?")
         elif abs(d) < 5:
-            self.l_main.configure(text=f"双删完成：几乎同时 | 时间差{abs(d):.0f}ms",
-                                  fg="#137333")
+            self.l_main.configure(text=f"双删完成：几乎同时 | 时间差{abs(d):.0f}ms")
         else:
             first = "网页端" if d > 0 else "客户端"
-            self.l_main.configure(text=f"双删完成：{first}先 | 时间差{abs(d):.0f}ms",
-                                  fg="#137333")
+            self.l_main.configure(text=f"双删完成：{first}先 | 时间差{abs(d):.0f}ms")
 
         # 次结论：请求发出时刻差（这个才是能调到 0 的）
         sd = r.get("send_diff")
@@ -214,7 +228,8 @@ class App:
 
         self.busy = True
         core.LAST_RESULT.clear()
-        self.l_main.configure(text="双删完成：执行中…", fg="#202124")
+        self.l_ok.configure(text="双端删除：执行中…", fg="#202124")
+        self.l_main.configure(text="双删完成：执行中…")
         self.l_send.configure(text="请求发出：—")
         self.log("\n" + "=" * 52 + "\n")
         self.log(">>> " + ("只看不删" if dry else "同步删除") + "\n")
