@@ -467,6 +467,8 @@ def main():
     ts = {}
     ev = {"req": None, "req_url": "", "req_body": "", "resp": None, "req_m": ""}
     all_req = []
+    del_events = []      # garbagedelete 请求/响应的完整流水
+    task_polls = []      # 提交任务之后，网页端一轮一轮查进度的记录
     # 网页端删除请求真正发出的那一刻会置位，客户端据此立刻点击
     sent_event = threading.Event()
 
@@ -476,20 +478,33 @@ def main():
         # 必须限定成「删除接口」本身。点确定后浏览器可能先发别的 POST（埋点、上报之类），
         # 如果拿它当触发信号，客户端会在网页端真正删除之前就被点下去。
         is_delete_api = (r.method in ("POST", "DELETE", "PUT")
-                         and "delete" in r.url.lower())
+                         and "garbagedelete" in r.url.lower())
+        if is_delete_api:
+            try:
+                body = r.post_data or ""
+            except Exception:
+                body = ""
+            # 请求体是 URL 编码的（%22fs_id%22），所以不能按 "fs_id" 带引号去数
+            del_events.append({
+                "kind": "req", "t": now, "url": r.url,
+                "n": body.count("fs_id"), "blen": len(body), "body": body,
+            })
         if ev["req"] is None and is_delete_api:
             ev["req"] = now
             ev["req_m"] = r.method
             ev["req_url"] = r.url
-            try:
-                ev["req_body"] = (r.post_data or "")[:400]
-            except Exception:
-                ev["req_body"] = ""
+            ev["req_body"] = (del_events[-1]["body"] if del_events else "")[:400]
             sent_event.set()
 
     def on_response(r):
         if ev["resp"] is None and ev["req_url"] and r.url == ev["req_url"]:
             ev["resp"] = time.perf_counter_ns()
+        low = r.url.lower()
+        if "garbagedelete" in low:
+            del_events.append({"kind": "resp", "t": time.perf_counter_ns(),
+                               "url": r.url, "status": r.status})
+        elif "garbagetaskquery" in low:
+            task_polls.append({"t": time.perf_counter_ns(), "status": r.status})
 
     page.on("request", on_request)
     page.on("response", on_response)
@@ -630,10 +645,28 @@ def main():
     # 关键: 用 wait_for_timeout 驱动 Playwright 事件循环。
     # 事件驱动模式下，request 事件派发得越快，客户端点得越贴近网页端发请求的那一刻，
     # 所以这里轮询间隔要短（20ms 太粗，会让残差直接多出 20ms）。
-    for _ in range(3000):
+    #
+    # 另外不能一看到第一个响应就收工：勾选数超过 300 时网页端会把删除做成异步任务，
+    # 提交完还在不停轮询进度（garbagetaskquery）。所以改成「请求数 + 轮询数连续 5 秒
+    # 都不再增加」才退出，最多盯 30 秒，免得网页端任务跑了很久把程序卡住。
+    t_end = time.perf_counter_ns() / 1e9 + 30.0
+    last_n_act = -1
+    idle_since = None
+    while time.perf_counter_ns() / 1e9 < t_end:
         page.wait_for_timeout(1)
-        if clip["done"] and ev["resp"]:
-            break
+        now_s = time.perf_counter_ns() / 1e9
+        n_req = sum(1 for e in del_events if e["kind"] == "req")
+        n_resp = sum(1 for e in del_events if e["kind"] == "resp")
+        # 网页端提交任务后会一直轮询进度，只要它还在查就不算结束
+        n_act = n_req + len(task_polls)
+        if clip["done"] and n_req > 0 and n_resp >= n_req:
+            if n_act != last_n_act:
+                last_n_act = n_act
+                idle_since = now_s
+            elif idle_since is not None and now_s - idle_since > 5.0:
+                break
+        else:
+            idle_since = None
     page.wait_for_timeout(400)
 
     # ---------------- 报告 ----------------
@@ -655,6 +688,34 @@ def main():
     else:
         print("未捕获 POST/DELETE 请求")
 
+    # 网页端删除任务全景：几个请求、各打包多少、是不是异步任务
+    reqs = [e for e in del_events if e["kind"] == "req"]
+    resps = [e for e in del_events if e["kind"] == "resp"]
+    if reqs:
+        print("\n===== ②b 网页端删除任务 =====")
+        print(f"   共发出 {len(reqs)} 个删除请求")
+        for i, e in enumerate(reqs, 1):
+            print(f"   #{i} 提交 距点击 {(e['t']-wc)/1e6:+9.1f} ms   "
+                  f"打包 {e['n']:>4} 个   body {e['blen']/1024:6.1f} KB")
+            if cc >= e["t"]:
+                print(f"        └─ 客户端点击落在它发出后 {(cc-e['t'])/1e6:+.1f} ms")
+            else:
+                print(f"        └─ 客户端点击比它早 {-(cc-e['t'])/1e6:.1f} ms")
+        for i, e in enumerate(resps, 1):
+            print(f"   ← 响应#{i} 距点击 {(e['t']-wc)/1e6:+9.1f} ms   状态 {e['status']}")
+        total = sum(e["n"] for e in reqs)
+        print(f"   合计打包 {total} 个文件（勾选了 {n_sel} 个）")
+        if total and total < n_sel:
+            print(f"   ⚠ 有 {n_sel - total} 个文件没进请求")
+        if task_polls:
+            print(f"\n   ★ 异步任务：提交后前端还在轮询进度，已抓到 {len(task_polls)} 次")
+            for i, e in enumerate(task_polls[:10], 1):
+                print(f"      轮询#{i} 距点击 {(e['t']-wc)/1e6:+9.1f} ms   状态 {e['status']}")
+            if len(task_polls) > 10:
+                print(f"      … 共 {len(task_polls)} 次，"
+                      f"最后一次 {(task_polls[-1]['t']-wc)/1e6:+.1f} ms")
+            print("      → 删除是服务器后台干的，网页端的「完成」要等这些轮询查到结果")
+
     print("\n===== ③ 客户端链路 =====")
     if clip["gone"]:
         print(f"确认弹窗消失(UI 立即关闭): 距点击 {(clip['gone']-cc)/1e6:+.1f} ms")
@@ -673,10 +734,16 @@ def main():
 
     # ④ 真实删除时间差：两端「删除真正生效」的时刻差，结论放到最后大字号输出
     client_done = clip["done_page"] or clip["refresh"]
+    # 网页端「删除完成」以最后一个删除响应为准：分批提交时，第一批回来不代表删完了
+    dl_resps = [e["t"] for e in del_events if e["kind"] == "resp"]
+    web_done_t = max(dl_resps) if dl_resps else ev["resp"]
+    # 但如果是异步任务（提交后还有一堆 garbagetaskquery 轮询），这个响应只是
+    # 「任务收下了」，服务器还在后台删。这种轮次里 ② 只能当下界看。
+    async_task = bool(task_polls)
     delta_ms = None
     delta_src = ""
-    if ev["resp"] and client_done:
-        delta_ms = (client_done - ev["resp"]) / 1e6
+    if web_done_t and client_done:
+        delta_ms = (client_done - web_done_t) / 1e6
         delta_src = "清理完成页" if clip["done_page"] else "列表区变化"
 
     web_local_ms = None
@@ -780,14 +847,21 @@ def main():
             print(f"     >>> 客户端先删，网页端晚 {-delta_ms:.1f} ms <<<")
         if not clip["done_page"]:
             print(f"     ⚠ 没抓到「清理完成」页，客户端信号是「{delta_src}」→ 这个数不准")
+        if async_task:
+            print(f"     ⚠ 网页端是异步任务：提交后又在后台轮询 {len(task_polls)} 次，"
+                  f"最后一次在 {(task_polls[-1]['t']-wc)/1e6:+.0f} ms")
+            print("        那个响应只代表「任务收下了」，真正删完比它更晚 →")
+            print("        这个数只是个下界，不用拿它调参；能调到 0 的是上面 ①")
         hist_d = [v for v in (cal.get("delta_history") or [])
                   if isinstance(v, (int, float))]
         if hist_d:
             recent = " | ".join(f"{v:+.0f}" for v in hist_d[-5:])
             print(f"     最近几次(仅参考): {recent}  →  本次 {delta_ms:+.0f}")
-        cal["delta_history"] = (hist_d + [round(delta_ms, 1)])[-9:]
-        cal["last_delta_ms"] = round(delta_ms, 1)
-        save_cal(cal)
+        # 异步任务的 ② 是下界，不具可比性，不写进历史，免得把趋势线带歪
+        if not async_task:
+            cal["delta_history"] = (hist_d + [round(delta_ms, 1)])[-9:]
+            cal["last_delta_ms"] = round(delta_ms, 1)
+            save_cal(cal)
 
     # 事件驱动模式下没有"下次建议"——提前量这个概念已经不用了，
     # 客户端是跟着网页端实际发出请求的那一刻动的，不用猜。
