@@ -39,6 +39,10 @@ CLIENT_LOCAL_MS = 7.0 # 客户端「点击→发出请求」的经验值（实�
 # 让界面不用去解析日志文本，数字来源只有一个，不会两处对不上。
 LAST_RESULT = {}
 
+# 中止原因：核对没过或流程没走通时由 main() 填一句话，
+# 界面直接把它显示在「同步删除」按钮上，2 秒后自动恢复。
+LAST_ERROR = ""
+
 
 # ---------------- 提前量自动校准（跨轮记忆） ----------------
 def cal_path():
@@ -311,9 +315,96 @@ def find_edge_exe():
     return None
 
 
+def _arrange_edge(win_w, win_h):
+    """把 Edge 主窗口摆到屏幕左上角并调整大小。
+
+    命令行里的 --window-position / --window-size 只在首次创建窗口时生效，
+    已经开着同一个 profile 再启动只会新开标签，所以这里直接搬窗口。
+    """
+    import ctypes
+
+    user32 = ctypes.windll.user32
+    hits = []
+
+    @ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+    def cb(hwnd, _):
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        title = ctypes.create_unicode_buffer(512)
+        user32.GetWindowTextW(hwnd, title, 512)
+        cls = ctypes.create_unicode_buffer(256)
+        user32.GetClassNameW(hwnd, cls, 256)
+        # 浏览器主窗口的类是 Chrome_WidgetWin_1，标题里带「百度网盘」
+        if cls.value == "Chrome_WidgetWin_1" and "百度" in title.value:
+            hits.append(hwnd)
+        return True
+
+    user32.EnumWindows(cb, None)
+    for h in hits:
+        user32.SetWindowPos(h, None, 0, 0, win_w, win_h, 0x0004)   # SWP_NOZORDER
+
+
+# 找登录页「去登录」按钮的中心坐标。
+# 注意不能只用 DOM 的 click()：百度这个按钮挂了事件委托，合成点击不生效，
+# 必须派发真实鼠标事件（这里的坐标交给 page.mouse.click 去点）。
+_FIND_LOGIN_JS = r"""() => {
+  const txt = document.body.innerText || '';
+  if (txt.indexOf('扫码登录') >= 0) return 'open';   // 二维码已经弹出来了
+  const nodes = [...document.querySelectorAll('a,div,span,button')]
+      .filter(n => (n.innerText || '').trim() === '去登录'
+                   && n.getBoundingClientRect().width > 0);
+  if (!nodes.length) return null;
+  const btn = nodes.find(n => n.tagName === 'BUTTON') || nodes[0];
+  const r = btn.getBoundingClientRect();
+  return [r.x + r.width / 2, r.y + r.height / 2];
+}"""
+
+
+def _ensure_login(timeout=8):
+    """启动 Edge 后检查登录态。
+
+    没登录（还停在登录页）就自动点一下「去登录」，把扫码二维码弹出来，
+    小康只要扫一下就行。已登录则什么都不做。
+
+    注意：不要在这里注入 cookies.json。实测百度会校验设备标识，
+    换 profile 注入的 Cookie 一律被拒，而且会覆盖掉当前有效的登录态。
+    """
+    deadline = time.time() + timeout
+    try:
+        with sync_playwright() as p:
+            b = p.chromium.connect_over_cdp(f"http://{HOST}:{PORT}")
+            ctx = b.contexts[0]
+            while time.time() < deadline:
+                page = next((pg for pg in ctx.pages
+                             if "baidu" in (pg.url or "")), None)
+                if page:
+                    try:
+                        pos = page.evaluate(_FIND_LOGIN_JS)
+                        if pos == "open":
+                            print("二维码已弹出，请扫码")
+                            return
+                        if pos:
+                            # 必须真实鼠标事件，合成 click 百度不认
+                            page.bring_to_front()
+                            page.wait_for_timeout(400)
+                            page.mouse.click(pos[0], pos[1])
+                            print("未登录: 已点击「去登录」，二维码已弹出，请扫码")
+                            return
+                        if "/login" not in (page.url or ""):
+                            print("登录态正常")
+                            return
+                    except Exception:
+                        pass
+                time.sleep(1)
+            print("WARN: 没等到登录状态，请手动在浏览器里登录")
+    except Exception as e:
+        print(f"WARN: 登录检查失败({e})")
+
+
 def launch_edge(wait_seconds=20):
     """启动带调试端口的 Edge（独立 profile，保留登录态）。
     返回 True 表示端口已就绪。"""
+    import ctypes
     import subprocess
     import urllib.request
 
@@ -325,10 +416,29 @@ def launch_edge(wait_seconds=20):
     ud = os.path.join(IMG_DIR, "_edge_profile")
     os.makedirs(ud, exist_ok=True)
 
-    print(f"启动 Edge: {exe}")
+    # 让后面算出来的坐标就是真实像素，不受 125% 缩放影响
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
+
+    # 浏览器固定在屏幕左侧、占屏宽 1/3、高度铺满工作区
+    user32 = ctypes.windll.user32
+    rc = (ctypes.c_long * 4)()
+    user32.SystemParametersInfoW(0x0030, 0, rc, 0)      # SPI_GETWORKAREA
+    phys_w, phys_h = rc[2] - rc[0], rc[3] - rc[1]
+    scale = max(1.0, user32.GetDpiForSystem() / 96.0)
+    dip_w, dip_h = int(phys_w / scale / 3), int(phys_h / scale)
+
+    print(f"启动 Edge: {exe}  窗口占左侧 1/3（{phys_w // 3}x{phys_h} 像素）")
     # 直接打开清理页：未登录会自动弹登录框，登录完成后仍回到这一页
     subprocess.Popen([exe, f"--remote-debugging-port={PORT}", f"--user-data-dir={ud}",
-                      "--no-first-run", CLEAR_URL],
+                      "--no-first-run",
+                      "--window-position=0,0", f"--window-size={dip_w},{dip_h}",
+                      CLEAR_URL],
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     for _ in range(wait_seconds * 2):
@@ -337,6 +447,10 @@ def launch_edge(wait_seconds=20):
             with urllib.request.urlopen(f"http://{HOST}:{PORT}/json/version", timeout=2) as r:
                 r.read()
             print("OK: 调试端口已就绪")
+            # 已经开着的 Edge 不理会 --window-size，得自己把窗口摆回左侧 1/3
+            _arrange_edge(phys_w // 3, phys_h)
+            # 没有登录态时用 cookies.json 补上，换电脑免扫码
+            _ensure_login()
             return True
         except Exception:
             pass
@@ -381,6 +495,8 @@ class _Tee:
 
 
 def main():
+    global LAST_ERROR
+    LAST_ERROR = ""
     dry = "--dry" in sys.argv
 
     # 上一轮若没还原 stdout，先收拾干净，避免文件句柄越攒越多
@@ -406,6 +522,7 @@ def main():
     found = find_confirm_dialog()
     if not found or not found[2]:
         print("ERROR: 未找到客户端确认弹窗(带确定/取消)，中止")
+        LAST_ERROR = "没找到客户端确定按钮"
         return
     dlg_hwnd, (L, T, R, B), cxy, dim, scale = found
     print(f"客户端确认弹窗 hwnd={dlg_hwnd} rect=({L},{T})-({R},{B}) {R-L}x{B-T}")
@@ -418,6 +535,7 @@ def main():
 
     if not port_ready():
         print(f"ERROR: Edge 调试端口 {PORT} 没开。请先点『启动 Edge』再试。")
+        LAST_ERROR = "请先点启动 Edge"
         return
 
     p = sync_playwright().start()
@@ -425,12 +543,14 @@ def main():
         b = p.chromium.connect_over_cdp(f"http://{HOST}:{PORT}")
     except Exception as e:
         print(f"ERROR: 连不上 Edge 调试端口 {PORT}: {e}")
+        LAST_ERROR = "连不上 Edge"
         p.stop()
         return
     ctx = b.contexts[0]
     page = next((pg for pg in ctx.pages if "/disk/clear" in pg.url), None)
     if not page:
         print("ERROR: 未找到网页清理页")
+        LAST_ERROR = "没找到网页清理页"
         p.stop()
         return
 
@@ -454,6 +574,7 @@ def main():
 
     if not info["dialogVisible"] or not info["confirm"]:
         print("ERROR: 网页端确认框未就绪，中止(不点击)")
+        LAST_ERROR = "没找到网页端确定按钮"
         p.stop()
         return
 

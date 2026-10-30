@@ -27,3 +27,11 @@ __pycache__/
 _gui_out.txt
 _gui_err.txt
 _cv2test.txt
+
+# 登录 Cookie：含 BDUSS，等同于账号密码，绝对不能提交
+cookies.json
+cookies.bak.json
+cookies*.json
+
+# 打包资源：Edge 图标必须入库（上面的 *.png 会误伤）
+!edge_icon.png

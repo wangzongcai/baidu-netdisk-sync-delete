@@ -1,33 +1,65 @@
 # -*- coding: utf-8 -*-
-"""双端同步删除 —— 双击即用的图形界面
+"""柚子双删 —— 迷你悬浮窗
 
-界面分上下两块：
-  上块「结论区」——常显，只放这一轮最要紧的两个时间差，一眼看完。
-  下块「详细日志」——默认收起，点右上角按钮才展开，排查问题时看。
+界面只有两件事：
+  上：启动 Edge（浅灰带边框的普通按钮）
+  下：同步删除（红底大字），跑的过程中在标题右侧用括号提示
+      （检测中…）→（删除中…），结束后 2 秒自动回到初始界面。
 
-设计原则：
-  1. 默认只核对，不删除。必须手动点『同步删除』才真正执行。
-  2. 勾选文件、调出确认框仍由小康自己操作，程序不代劳。
-  3. 详细日志收起也不影响落盘：sync_delete_log.txt 永远记全量。
+窗口 327px 宽，启动时落在屏幕右下角，默认置顶。
+最小化走任务栏（不是托盘），点任务栏图标就能恢复。
+勾选文件、调出确认框仍由小康自己操作，程序只负责两端同步那一下。
+详细日志不显示在界面上，全量仍然写进 sync_delete_log.txt。
 """
-import queue
+import ctypes
+import os
 import sys
 import threading
 import tkinter as tk
-from tkinter import messagebox, scrolledtext
 
 import sync_delete_v2 as core
 
 
-class Redirect:
-    """把 print 的输出转到队列，供界面显示。"""
+def asset(name):
+    """打包成 exe 后资源在 _MEIPASS 临时目录，源码运行时就在同目录。"""
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, name)
 
-    def __init__(self, q):
-        self.q = q
+FONT = "Microsoft YaHei"
+
+# 配色照 HTML 原型（ui_prototype.html）
+C_BORDER = "#c8ccd0"
+C_BAR = "#f1f3f4"
+C_TITLE = "#3c4043"
+C_WHITE = "#ffffff"
+C_BTN = "#f8f9fa"
+C_BTN_H = "#eef0f2"
+C_TEXT = "#202124"
+C_RED = "#d93025"
+C_RED_H = "#c5221f"
+C_GREY = "#9aa0a6"
+C_GREEN = "#137333"
+C_ICON = "#5f6368"
+C_CHECK = "#1a73e8"      # 检测中的蓝
+C_DEL = "#d93025"        # 删除中的红
+
+WIN_W = 327              # 窗口宽度（196 再放大 2/3）
+BAR_H = 60               # 标题栏高度
+PAD = 18                 # 内容区留白
+
+CHECK_MS = 1200          # 点下去先显示「检测中…」，这么久后切「删除中…」
+BACK_MS = 2000           # 结束后 2 秒回到初始界面
+
+
+class NullOut:
+    """打包成窗口程序后 stdout 可能为空，统一吞掉输出。
+
+    core 会再包一层 _Tee 把日志写进 sync_delete_log.txt，
+    所以排查问题仍然看那个文件，界面上不再显示。
+    """
 
     def write(self, s):
-        if s:
-            self.q.put(s)
+        pass
 
     def flush(self):
         pass
@@ -36,258 +68,248 @@ class Redirect:
 class App:
     def __init__(self, root):
         self.root = root
-        self.q = queue.Queue()
         self.busy = False
-        self.detail_shown = False        # 详细日志默认收起，每次启动都回到收起
+        self._off = (0, 0)
+        self._moved = False
+        self._check_job = None
 
-        root.title("双端同步删除")
-        root.geometry("860x660")
-        root.minsize(680, 520)
+        root.title("柚子双删V:11149778")   # 任务栏上显示的名字
+        root.overrideredirect(True)        # 自绘迷你标题栏，不要系统边框
+        root.attributes("-topmost", True)  # 默认置顶
+        root.configure(bg=C_BORDER)        # 外圈 1px 描边靠留白实现
 
-        # ---------- 顶部操作区 ----------
-        top = tk.Frame(root, padx=10, pady=8)
-        top.pack(fill="x")
+        outer = tk.Frame(root, bg=C_WHITE)
+        outer.pack(fill="both", expand=True, padx=1, pady=1)
 
-        tk.Button(top, text="① 启动 Edge 调试端口", command=self.do_launch,
-                  width=20).pack(side="left", padx=(0, 6))
+        self._build_bar(outer)
 
-        tk.Label(top, text="同步方式:").pack(side="left", padx=(14, 2))
-        # 留空 = 事件驱动（推荐）：等网页端请求真的发出去再点客户端。
-        # 填数字 = 时间预置：网页端点完固定等这么多毫秒，保留作对照用。
-        self.lead = tk.Entry(top, width=7)
-        self.lead.pack(side="left")
+        self.body = tk.Frame(outer, bg=C_WHITE, padx=PAD, pady=PAD)
+        self.body.pack(fill="both", expand=True)
 
-        tk.Label(top, text="发出差ms:").pack(side="left", padx=(10, 2))
-        # 留空 = 立刻点（现状，实测差 7ms 左右）。
-        # 填数字 = 目标「两端请求发出」的时间差，用来对照「差值大小有无影响」。
-        self.gap = tk.Entry(top, width=6)
-        self.gap.pack(side="left")
-
-        # 详细日志开关放在右上角
-        self.detail_btn = tk.Button(top, text="详细日志 ▾", command=self.toggle_detail)
-        self.detail_btn.pack(side="right")
-
-        # ---------- 主按钮 ----------
-        mid = tk.Frame(root, padx=10)
-        mid.pack(fill="x", pady=(0, 6))
-        tk.Button(mid, text="② 同步删除（自动核对后直接执行）", command=lambda: self.run(False),
-                  bg="#d93025", fg="white", height=2,
-                  font=("Microsoft YaHei", 11, "bold")).pack(fill="x", side="left", expand=True)
-        tk.Button(mid, text="只看不删", command=lambda: self.run(True),
-                  bg="#e8f0fe", width=10).pack(side="left", padx=(6, 0))
-
-        # ---------- 上块：结论区（常显） ----------
-        brief = tk.Frame(root, bg="#f5f7fa", bd=1, relief="solid")
-        brief.pack(fill="x", padx=10, pady=(0, 6))
-
-        # 上下文一行：勾了几个、网页端本地段多久、完成信号可不可信
-        self.l_ctx = tk.Label(brief, text="等待执行 · 勾好文件、调出确认框后点『同步删除』",
-                              bg="#f5f7fa", fg="#5f6368",
-                              font=("Microsoft YaHei", 9), anchor="w")
-        self.l_ctx.pack(fill="x", padx=12, pady=(8, 2))
-
-        # 第一结论：双端到底删成了没有 —— 服务器 errno 和客户端完成页给答案，
-        # 这比时间差重要得多，所以放最大最上面
-        self.l_ok = tk.Label(brief, text="双端删除：—",
-                             bg="#f5f7fa", fg="#202124",
-                             font=("Microsoft YaHei", 16, "bold"), anchor="w")
-        self.l_ok.pack(fill="x", padx=12, pady=(2, 0))
-
-        # 第二结论：谁先删完、差多少 —— 先删完的永远排在这一行里最前面
-        self.l_main = tk.Label(brief, text="双删完成：—",
-                               bg="#f5f7fa", fg="#5f6368",
-                               font=("Microsoft YaHei", 12), anchor="w")
-        self.l_main.pack(fill="x", padx=12, pady=(0, 2))
-
-        # 次结论：两端请求「发出」时刻差
-        self.l_send = tk.Label(brief, text="请求发出：—",
-                               bg="#f5f7fa", fg="#5f6368",
-                               font=("Microsoft YaHei", 10), anchor="w")
-        self.l_send.pack(fill="x", padx=12, pady=(2, 8))
-
-        # ---------- 下块：详细日志（默认收起） ----------
-        self.detail = tk.Frame(root, padx=10)
-        self.txt = scrolledtext.ScrolledText(self.detail, wrap="word",
-                                             font=("Consolas", 10))
-        self.txt.pack(fill="both", expand=True)
-        self.txt.configure(state="disabled")
-
-        self.log("使用顺序：\n"
-                 "  1. 点『启动 Edge 调试端口』——会直接打开清理页；\n"
-                 "     第一次没登录，在那里扫码登录一次，登录完自动回到清理页。\n"
-                 "     等扫描完成再往下走。\n"
-                 "  2. 打开客户端重复文件清理页，等扫描完成。\n"
-                 "  3. 两端勾选要删的文件（勾几个都行），点『删除』把确认框调出来。\n"
-                 "  4. 点『② 同步删除』——程序自动核对两端，通过后立即执行。\n"
-                 "     核对不通过（比如确认框没调出来）会自动中止，不会乱点。\n"
-                 "─────────────────────────────────────────────\n")
-        self.log("同步方式：默认『事件驱动』——网页端删除请求一发出，客户端立刻跟着点，\n"
-                 "不需要预测提前量，也不用校准。两个输入框都留空即可。\n"
-                 "  · 同步方式填数字 = 时间预置：网页端点完固定等 N 毫秒再点客户端。\n"
-                 "  · 发出差填数字 = 目标「两端请求发出」的时间差。比如填 50，\n"
-                 "    程序会让客户端晚一点发，让两条请求拉开 50ms，用来做对照实验。\n\n")
-
-        self.pump()
-
-    # ---------- 界面输出 ----------
-    def log(self, s):
-        self.txt.configure(state="normal")
-        self.txt.insert("end", s)
-        self.txt.see("end")
-        self.txt.configure(state="disabled")
-
-    def pump(self):
-        """把队列里的输出刷到详细日志区。"""
+        # Edge 图标：从 msedge.exe 提取的 32×32，打包时一起带上
         try:
-            while True:
-                self.log(self.q.get_nowait())
-        except queue.Empty:
-            pass
-        self.root.after(80, self.pump)
+            self.edge_img = tk.PhotoImage(file=asset("edge_icon.png"))
+        except Exception:
+            self.edge_img = None
 
-    def toggle_detail(self):
-        """展开 / 收起详细日志。窗口变矮变高时结论区始终留在上面。"""
-        if self.detail_shown:
-            self.detail.pack_forget()
-            self.detail_btn.configure(text="详细日志 ▾")
-        else:
-            self.detail.pack(fill="both", expand=True, pady=(0, 8))
-            self.detail_btn.configure(text="详细日志 ▴")
-        self.detail_shown = not self.detail_shown
+        # 浅灰底 + 细边框：tk 的 solid 边框是黑的，用外层 Frame 垫 1px 画出原型里的浅灰边
+        edge_wrap = tk.Frame(self.body, bg=C_BORDER)
+        edge_wrap.pack(fill="x", pady=(0, PAD))
+        btn_kw = dict(image=self.edge_img, compound="left") if self.edge_img else {}
+        self.edge_btn = tk.Button(
+            edge_wrap, text="   启动 Edge", command=self.do_launch,
+            bg=C_BTN, fg=C_TEXT, activebackground=C_BTN_H, activeforeground=C_TEXT,
+            relief="flat", bd=0, font=(FONT, 17), cursor="hand2", **btn_kw)
+        self.edge_btn.pack(fill="x", padx=1, pady=1, ipady=8)
 
-    # ---------- 结论区渲染 ----------
-    def show_brief(self):
-        """把 core.LAST_RESULT 里的数字渲染成一句话。
+        self.main_btn = tk.Button(
+            self.body, text="同步删除", command=self.do_run,
+            bg=C_RED, fg=C_WHITE, activebackground=C_RED_H, activeforeground=C_WHITE,
+            relief="flat", bd=0, font=(FONT, 19, "bold"), cursor="hand2",
+            disabledforeground=C_WHITE)
+        self.main_btn.pack(fill="x", ipady=18)
 
-        格式约定：『双删完成：客户端先 | 时间差120ms』
-        —— 先删完的那端写在前面，时间差取绝对值，不写正负号。
-        """
-        r = dict(core.LAST_RESULT)
-        if not r:
-            self.l_ctx.configure(text="没拿到本轮数据（只核对不删，或执行出错）")
-            self.l_ok.configure(text="双端删除：—", fg="#202124")
-            self.l_main.configure(text="双删完成：—", fg="#5f6368")
-            self.l_send.configure(text="请求发出：—")
-            return
+        root.update_idletasks()
+        self._install_taskbar()
+        self._place()
 
-        # 上下文
-        ctx = f"本次：勾选 {r.get('n_sel', '?')} 个"
-        wl = r.get("web_local_ms")
-        if wl is not None:
-            ctx += f" · 网页端本地段 {wl:.0f} ms"
-        self.l_ctx.configure(text=ctx)
+    # ---------- 标题栏 ----------
+    def _build_bar(self, parent):
+        bar = tk.Frame(parent, bg=C_BAR, height=BAR_H)
+        bar.pack(fill="x")
+        bar.pack_propagate(False)
 
-        # 第一条：双端成败。网页端看服务器 errno，客户端看「清理完成」页
-        def mark(v):
-            return "✓" if v is True else ("✗" if v is False else "?")
-        wo, co = r.get("web_ok"), r.get("client_ok")
-        self.l_ok.configure(
-            text=f"双端删除：网页端 {mark(wo)} | 客户端 {mark(co)}",
-            fg="#137333" if (wo is True and co is True)
-            else ("#c5221f" if (wo is False or co is False) else "#b26a00"))
+        title = tk.Label(bar, text="柚子双删V:11149778", bg=C_BAR, fg=C_TITLE,
+                         font=(FONT, 11), anchor="w")
+        title.pack(side="left", padx=(PAD, 0))
 
-        # 第二条：谁先删完、差多少（时间差随服务器快慢被拉大，仅参考）
-        # 符号约定 delta = 客户端完成 − 网页端完成，正数 = 网页端先删完
-        d = r.get("delta_ms")
-        if d is None:
-            self.l_main.configure(text="双删完成：未测到 | 时间差 ?")
-        elif abs(d) < 5:
-            self.l_main.configure(text=f"双删完成：几乎同时 | 时间差{abs(d):.0f}ms")
-        else:
-            first = "网页端" if d > 0 else "客户端"
-            self.l_main.configure(text=f"双删完成：{first}先 | 时间差{abs(d):.0f}ms")
+        # 运行状态：标题右边括号提示，两个阶段颜色分开
+        self.state_lbl = tk.Label(bar, text="", bg=C_BAR, fg=C_CHECK,
+                                  font=(FONT, 10), anchor="w")
+        self.state_lbl.pack(side="left", padx=(6, 0))
 
-        # 次结论：请求发出时刻差（这个才是能调到 0 的）
-        sd = r.get("send_diff")
-        if sd is None:
-            self.l_send.configure(text="请求发出：未测到")
-        elif abs(sd) < 5:
-            self.l_send.configure(text=f"请求发出：两端几乎同时（{sd:+.1f} ms）")
-        elif sd > 0:
-            self.l_send.configure(text=f"请求发出：客户端晚 {sd:.1f} ms")
-        else:
-            self.l_send.configure(text=f"请求发出：客户端早 {-sd:.1f} ms")
+        # 关闭：悬停变红底白字，跟系统窗口一致
+        close = tk.Label(bar, text="×", bg=C_BAR, fg=C_ICON,
+                         font=("Segoe UI", 20), padx=10, cursor="hand2")
+        close.pack(side="right", padx=(0, 6))
+        close.bind("<Button-1>", lambda e: self.root.destroy())
+        close.bind("<Enter>", lambda e: close.configure(bg=C_RED, fg=C_WHITE))
+        close.bind("<Leave>", lambda e: close.configure(bg=C_BAR, fg=C_ICON))
+
+        # 最小化：一根短横线（比「—」字符短一半）
+        minc = tk.Canvas(bar, width=43, height=43, bg=C_BAR,
+                         highlightthickness=0, cursor="hand2")
+        minc.create_line(16, 21, 28, 21, fill=C_ICON, width=2)
+        minc.pack(side="right")
+        minc.bind("<Button-1>", lambda e: self.do_minimize())
+        minc.bind("<Enter>", lambda e: minc.configure(bg=C_BTN_H))
+        minc.bind("<Leave>", lambda e: minc.configure(bg=C_BAR))
+
+        # 拖窗口
+        for w in (bar, title):
+            w.bind("<Button-1>", self._press)
+            w.bind("<B1-Motion>", self._drag)
+            w.bind("<ButtonRelease-1>", self._release)
+
+    def _install_taskbar(self):
+        """无边框窗口默认不进任务栏，补上 WS_EX_APPWINDOW，
+        最小化后才会有任务栏按钮可点。"""
+        try:
+            hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
+            ex = ctypes.windll.user32.GetWindowLongW(hwnd, -20)   # GWL_EXSTYLE
+            ctypes.windll.user32.SetWindowLongW(hwnd, -20, ex | 0x00040000)
+            self.hwnd = hwnd
+        except Exception:
+            self.hwnd = None
+
+    def _place(self):
+        """启动位置：屏幕右下，右沿固定、底边避开任务栏。"""
+        h = self.root.winfo_reqheight()
+        sw = self.root.winfo_screenwidth()
+        sh = self.root.winfo_screenheight()
+        x = sw - WIN_W - 325
+        y = sh - 52 - h - 8
+        self.root.geometry(f"{WIN_W}x{h}+{x}+{y}")
+
+    def _press(self, e):
+        self._off = (e.x_root - self.root.winfo_x(),
+                     e.y_root - self.root.winfo_y())
+        self._moved = False
+
+    def _drag(self, e):
+        x = e.x_root - self._off[0]
+        y = e.y_root - self._off[1]
+        if abs(x - self.root.winfo_x()) > 2 or abs(y - self.root.winfo_y()) > 2:
+            self._moved = True
+        self.root.geometry(f"+{x}+{y}")
+
+    def _release(self, e):
+        self._moved = False
+
+    def do_minimize(self):
+        """最小化进任务栏（不是托盘），点任务栏图标恢复。"""
+        if not self.hwnd:
+            self._install_taskbar()
+        if self.hwnd:
+            ctypes.windll.user32.ShowWindow(self.hwnd, 6)   # SW_MINIMIZE
 
     # ---------- 动作 ----------
     def do_launch(self):
         if self.busy:
             return
         self.busy = True
-        self.log("\n>>> 启动 Edge...\n")
+        self.edge_btn.configure(state="disabled")
+        threading.Thread(target=self._launch_work, daemon=True).start()
 
-        def work():
-            old = sys.stdout
-            sys.stdout = Redirect(self.q)
-            try:
-                core.launch_edge()
-            except Exception as e:
-                print(f"ERROR: {e}")
-            finally:
-                sys.stdout = old
-                self.busy = False
-                self.q.put("\n")
+    def _launch_work(self):
+        old = sys.stdout
+        sys.stdout = NullOut()
+        try:
+            core.launch_edge()
+        except Exception:
+            pass
+        finally:
+            sys.stdout = old
+            self.root.after(0, self._launch_done)
 
-        threading.Thread(target=work, daemon=True).start()
+    def _launch_done(self):
+        self.busy = False
+        self.edge_btn.configure(state="normal")
 
-    def run(self, dry):
+    def do_run(self):
         if self.busy:
-            messagebox.showinfo("请稍等", "上一个操作还没结束。")
             return
-
         self.busy = True
         core.LAST_RESULT.clear()
-        self.l_ok.configure(text="双端删除：执行中…", fg="#202124")
-        self.l_main.configure(text="双删完成：执行中…")
-        self.l_send.configure(text="请求发出：—")
-        self.log("\n" + "=" * 52 + "\n")
-        self.log(">>> " + ("只看不删" if dry else "同步删除") + "\n")
+        self.edge_btn.configure(state="disabled")
+        self._set_stage("check")
+        # core 内部先核对再删除，这里按时间切一次阶段提示
+        self._check_job = self.root.after(CHECK_MS, self._to_delete_stage)
+        threading.Thread(target=self._run_work, daemon=True).start()
 
-        args = []
-        if dry:
-            args.append("--dry")
-        lead = self.lead.get().strip()
-        if lead:
-            try:
-                float(lead)
-                args.append(f"--lead={lead}")
-            except ValueError:
-                self.log(f"同步方式填的 '{lead}' 不是数字，按事件驱动处理\n")
+    def _set_stage(self, stage):
+        # 提示类文字比主按钮字号小一档，长句子才塞得进按钮宽度
+        small = (FONT, 14, "bold")
+        if stage == "check":
+            self.state_lbl.configure(text="（检测中…）", fg=C_CHECK)
+            self.main_btn.configure(state="disabled", bg=C_GREY,
+                                    text="请稍候", font=small, cursor="")
+        else:
+            self.state_lbl.configure(text="（删除中…）", fg=C_DEL)
+            self.main_btn.configure(state="disabled", bg=C_GREY,
+                                    text="删除中…", font=small, cursor="")
 
-        gap = self.gap.get().strip()
-        if gap:
-            try:
-                float(gap)
-                args.append(f"--gap={gap}")
-            except ValueError:
-                self.log(f"发出差填的 '{gap}' 不是数字，按即时点击处理\n")
+    def _to_delete_stage(self):
+        self._check_job = None
+        if self.busy:
+            self._set_stage("delete")
 
-        def work():
-            old_argv, old_out = sys.argv, sys.stdout
-            sys.argv = ["sync_delete_v2"] + args
-            sys.stdout = Redirect(self.q)
-            try:
-                core.main()
-            except Exception as e:
-                import traceback
-                print(f"\nERROR: {e}\n")
-                traceback.print_exc()
-            finally:
-                sys.stdout = old_out
-                sys.argv = old_argv
-                self.busy = False
-                self.q.put("\n>>> 完成\n")
-                # 结论区要在主线程更新，交给 tk 的事件循环
-                self.root.after(0, self.show_brief)
+    def _run_work(self):
+        old_argv, old_out = sys.argv, sys.stdout
+        sys.argv = ["sync_delete_v2"]
+        sys.stdout = NullOut()
+        try:
+            core.main()
+        except Exception:
+            pass
+        finally:
+            sys.stdout = old_out
+            sys.argv = old_argv
+            self.root.after(0, self._show_result)
 
-        threading.Thread(target=work, daemon=True).start()
+    def _show_result(self):
+        """结果直接写在「同步删除」按钮上，2 秒后自动回初始界面。
+
+        成功只显示「双删已完成」；失败显示具体原因（没找到哪一端的确定按钮、
+        哪一端没删成），免得只看到一句「失败」还要去翻日志。
+        """
+        self.busy = False
+        if self._check_job:
+            self.root.after_cancel(self._check_job)
+            self._check_job = None
+        self.edge_btn.configure(state="normal")
+        self.state_lbl.configure(text="")
+
+        r = dict(core.LAST_RESULT)
+        err = getattr(core, "LAST_ERROR", "") or ""
+        web_ok, cli_ok = r.get("web_ok"), r.get("client_ok")
+
+        if web_ok is True and cli_ok is True:
+            text, bg = "双删已完成", C_GREEN
+        elif err:
+            text, bg = err, C_RED
+        elif web_ok is False:
+            text, bg = "网页端没删成", C_RED
+        elif cli_ok is False:
+            text, bg = "客户端没删成", C_RED
+        else:
+            text, bg = "未完成，重试", C_RED
+
+        self.main_btn.configure(state="disabled", bg=bg, text=text,
+                                font=(FONT, 14, "bold"), cursor="")
+        self.root.after(BACK_MS, self._reset)
+
+    def _reset(self):
+        """回到初始界面：红色「同步删除」，标题栏不留状态。"""
+        self.state_lbl.configure(text="")
+        if not self.busy:
+            self.main_btn.configure(state="normal", bg=C_RED,
+                                    text="同步删除",
+                                    font=(FONT, 19, "bold"), cursor="hand2")
 
 
 def main():
-    root = tk.Tk()
+    # 先声明 DPI 感知，tk 拿到的屏幕尺寸才和真实像素一致，
+    # 否则 125% 缩放下窗口位置会飘到屏幕外
     try:
-        root.iconbitmap(default="")
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
     except Exception:
-        pass
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
+
+    root = tk.Tk()
     App(root)
     root.mainloop()
 
