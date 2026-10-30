@@ -425,15 +425,15 @@ def launch_edge(wait_seconds=20):
         except Exception:
             pass
 
-    # 浏览器固定在屏幕左侧、占屏宽 1/3、高度铺满工作区
+    # 浏览器固定在屏幕左侧、占屏宽 1/2、高度铺满工作区
     user32 = ctypes.windll.user32
     rc = (ctypes.c_long * 4)()
     user32.SystemParametersInfoW(0x0030, 0, rc, 0)      # SPI_GETWORKAREA
     phys_w, phys_h = rc[2] - rc[0], rc[3] - rc[1]
     scale = max(1.0, user32.GetDpiForSystem() / 96.0)
-    dip_w, dip_h = int(phys_w / scale / 3), int(phys_h / scale)
+    dip_w, dip_h = int(phys_w / scale / 2), int(phys_h / scale)
 
-    print(f"启动 Edge: {exe}  窗口占左侧 1/3（{phys_w // 3}x{phys_h} 像素）")
+    print(f"启动 Edge: {exe}  窗口占左侧 1/2（{phys_w // 2}x{phys_h} 像素）")
     # 直接打开清理页：未登录会自动弹登录框，登录完成后仍回到这一页
     subprocess.Popen([exe, f"--remote-debugging-port={PORT}", f"--user-data-dir={ud}",
                       "--no-first-run",
@@ -447,8 +447,8 @@ def launch_edge(wait_seconds=20):
             with urllib.request.urlopen(f"http://{HOST}:{PORT}/json/version", timeout=2) as r:
                 r.read()
             print("OK: 调试端口已就绪")
-            # 已经开着的 Edge 不理会 --window-size，得自己把窗口摆回左侧 1/3
-            _arrange_edge(phys_w // 3, phys_h)
+            # 已经开着的 Edge 不理会 --window-size，得自己把窗口摆回左侧 1/2
+            _arrange_edge(phys_w // 2, phys_h)
             # 没有登录态时用 cookies.json 补上，换电脑免扫码
             _ensure_login()
             return True
