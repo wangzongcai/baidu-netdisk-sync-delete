@@ -402,10 +402,12 @@ def _ensure_login(timeout=8):
 
 
 def launch_edge(wait_seconds=20):
-    """启动带调试端口的 Edge（独立 profile，保留登录态）。
+    """启动带调试端口的 Edge（每次用全新临时 profile，不保存登录态）。
     返回 True 表示端口已就绪。"""
     import ctypes
+    import shutil
     import subprocess
+    import tempfile
     import urllib.request
 
     exe = find_edge_exe()
@@ -413,8 +415,22 @@ def launch_edge(wait_seconds=20):
         print("ERROR: 没找到 msedge.exe，请确认已安装 Edge")
         return False
 
-    ud = os.path.join(IMG_DIR, "_edge_profile")
-    os.makedirs(ud, exist_ok=True)
+    # 每次都用全新临时目录，不再复用 _edge_profile：
+    # 登录 Cookie 只活在本次浏览器里，下次启动一定是未登录状态。
+    # 顺手清掉异常退出留下的、超过 1 天的旧临时目录。
+    tmp_root = tempfile.gettempdir()
+    prefix = "youzi_edge_profile_"
+    now = time.time()
+    for name in os.listdir(tmp_root):
+        if not name.startswith(prefix):
+            continue
+        old = os.path.join(tmp_root, name)
+        try:
+            if os.path.isdir(old) and now - os.path.getmtime(old) > 86400:
+                shutil.rmtree(old, ignore_errors=True)
+        except Exception:
+            pass
+    ud = tempfile.mkdtemp(prefix=prefix)
 
     # 让后面算出来的坐标就是真实像素，不受 125% 缩放影响
     try:
@@ -425,37 +441,69 @@ def launch_edge(wait_seconds=20):
         except Exception:
             pass
 
-    # 浏览器固定在屏幕左侧、占屏宽 1/2、高度铺满工作区
+    # 浏览器固定在屏幕左侧、占屏宽 2/3、高度铺满工作区
     user32 = ctypes.windll.user32
     rc = (ctypes.c_long * 4)()
     user32.SystemParametersInfoW(0x0030, 0, rc, 0)      # SPI_GETWORKAREA
     phys_w, phys_h = rc[2] - rc[0], rc[3] - rc[1]
     scale = max(1.0, user32.GetDpiForSystem() / 96.0)
-    dip_w, dip_h = int(phys_w / scale / 2), int(phys_h / scale)
+    win_w = phys_w * 2 // 3
+    dip_w, dip_h = int(phys_w / scale * 2 / 3), int(phys_h / scale)
 
-    print(f"启动 Edge: {exe}  窗口占左侧 1/2（{phys_w // 2}x{phys_h} 像素）")
+    print(f"启动 Edge: {exe}  窗口占左侧 2/3（{win_w}x{phys_h} 像素），临时 profile 不保存登录态")
     # 直接打开清理页：未登录会自动弹登录框，登录完成后仍回到这一页
-    subprocess.Popen([exe, f"--remote-debugging-port={PORT}", f"--user-data-dir={ud}",
-                      "--no-first-run",
-                      "--window-position=0,0", f"--window-size={dip_w},{dip_h}",
-                      CLEAR_URL],
-                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # 全新 profile 会触发 Edge 的微软账户自动登录/同步确认框，禁用这些功能；
+    # 只影响本工具启动的临时浏览器，不改正常 Edge 的全局设置。
+    edge_flags = ("--disable-sync",
+                  "--disable-features=msEdgeAutoLogon,msEdgeAutoSignIn,"
+                  "msEdgeSigninInterception,msEdgeSyncConsent,msSignIn,msEdgeSignIn")
+    proc = subprocess.Popen([exe, f"--remote-debugging-port={PORT}", f"--user-data-dir={ud}",
+                             "--no-first-run", "--no-default-browser-check",
+                             *edge_flags,
+                             "--window-position=0,0", f"--window-size={dip_w},{dip_h}",
+                             CLEAR_URL],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-    for _ in range(wait_seconds * 2):
-        time.sleep(0.5)
+    # 浏览器退出后删除临时 profile。启动进程可能只是引导器，所以除了等进程，
+    # 还要确认调试端口也关闭；launch_done 防止浏览器还没起好就被误删目录。
+    launch_done = threading.Event()
+
+    def _cleanup_profile():
+        launch_done.wait()
         try:
-            with urllib.request.urlopen(f"http://{HOST}:{PORT}/json/version", timeout=2) as r:
-                r.read()
-            print("OK: 调试端口已就绪")
-            # 已经开着的 Edge 不理会 --window-size，得自己把窗口摆回左侧 1/2
-            _arrange_edge(phys_w // 2, phys_h)
-            # 没有登录态时用 cookies.json 补上，换电脑免扫码
-            _ensure_login()
-            return True
+            proc.wait()
         except Exception:
             pass
-    print(f"ERROR: 端口 {PORT} 未就绪")
-    return False
+        deadline = time.time() + 12 * 3600
+        while time.time() < deadline and port_ready():
+            time.sleep(2)
+        for _ in range(10):
+            try:
+                shutil.rmtree(ud)
+                break
+            except Exception:
+                time.sleep(1)
+
+    threading.Thread(target=_cleanup_profile, daemon=True).start()
+
+    try:
+        for _ in range(wait_seconds * 2):
+            time.sleep(0.5)
+            try:
+                with urllib.request.urlopen(f"http://{HOST}:{PORT}/json/version", timeout=2) as r:
+                    r.read()
+                print("OK: 调试端口已就绪")
+                # 已经开着的 Edge 不理会 --window-size，得自己把窗口摆回左侧 2/3
+                _arrange_edge(win_w, phys_h)
+                # 全新 profile 下通常是未登录状态，需要时弹出扫码二维码
+                _ensure_login()
+                return True
+            except Exception:
+                pass
+        print(f"ERROR: 端口 {PORT} 未就绪")
+        return False
+    finally:
+        launch_done.set()
 
 
 def port_ready():

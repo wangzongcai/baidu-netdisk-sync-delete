@@ -22,6 +22,7 @@ _*.png
 __pycache__/
 *.pyc
 *.pyo
+.venv/
 
 # ===== 调试输出 =====
 _gui_out.txt

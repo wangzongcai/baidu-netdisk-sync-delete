@@ -1,9 +1,15 @@
-﻿# 启动带调试端口的 Edge（独立 profile，保留登录态）
+﻿# 启动带调试端口的 Edge（每次全新临时 profile，不保存登录态）
 # 路径全部相对脚本所在目录，换电脑直接跑，不用改
 $ErrorActionPreference = "Stop"
 $port = 9222
-$ud = Join-Path $PSScriptRoot "_edge_profile"
-if (-not (Test-Path $ud)) { New-Item -ItemType Directory -Force -Path $ud | Out-Null }
+$prefix = "youzi_edge_profile_"
+$tmpRoot = [System.IO.Path]::GetTempPath()
+# 清理异常退出留下的旧临时配置；正在使用的目录因文件占用会跳过
+Get-ChildItem $tmpRoot -Directory -Filter "$prefix*" -ErrorAction SilentlyContinue |
+  Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-1) } |
+  Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+$ud = Join-Path $tmpRoot ($prefix + [guid]::NewGuid().ToString("N"))
+New-Item -ItemType Directory -Force -Path $ud | Out-Null
 
 # 自动定位 msedge.exe（64 位 / 32 位 / 默认安装位置都试一遍）
 $cands = @(
@@ -14,14 +20,18 @@ $cands = @(
 $edge = $cands | Where-Object { Test-Path $_ } | Select-Object -First 1
 if (-not $edge) { Write-Output "ERROR: 没找到 msedge.exe，请手动确认 Edge 安装位置"; return }
 
-# 先关掉占用同一个 profile 的旧实例，否则单实例合并会让调试端口失效
-Get-CimInstance Win32_Process -Filter "Name='msedge.exe'" -ErrorAction SilentlyContinue |
-  Where-Object { $_.CommandLine -match [regex]::Escape($ud) } |
-  ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-Start-Sleep -Seconds 1
+# 初始窗口放在屏幕左侧，占工作区宽度 2/3；主程序启动后还会再精确搬一次窗口
+Add-Type -AssemblyName System.Windows.Forms
+$wa = [System.Windows.Forms.SystemInformation]::WorkingArea
+$winW = [int]($wa.Width * 2 / 3)
+$winH = [int]$wa.Height
 
-# 直接打开清理页：未登录会自动弹登录框，登录完成后仍回到这一页
-$argsList = @("--remote-debugging-port=$port", "--user-data-dir=$ud", "--no-first-run", "https://pan.baidu.com/disk/clear")
+# 直接打开清理页：每次全新 profile，未登录会弹登录框，登录完成后仍回到这一页
+# 禁用 Edge 自己的微软账户自动登录/同步确认框，不影响百度网盘扫码登录
+$edgeFlags = @("--disable-sync", "--disable-features=msEdgeAutoLogon,msEdgeAutoSignIn,msEdgeSigninInterception,msEdgeSyncConsent,msSignIn,msEdgeSignIn")
+$argsList = @("--remote-debugging-port=$port", "--user-data-dir=$ud", "--no-first-run",
+  "--no-default-browser-check") + $edgeFlags + @("--window-position=0,0", "--window-size=$winW,$winH",
+  "https://pan.baidu.com/disk/clear")
 Start-Process -FilePath $edge -ArgumentList $argsList -WindowStyle Normal
 
 # 等待端口就绪
